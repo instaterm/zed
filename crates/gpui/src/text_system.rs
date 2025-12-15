@@ -286,6 +286,16 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.descent(font_size))
     }
 
+    /// Get the recommended position of the underline for the given font and size.
+    pub fn underline_position(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.underline_position(font_size))
+    }
+
+    /// Get the recommended thickness of the underline for the given font and size.
+    pub fn underline_thickness(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.underline_thickness(font_size))
+    }
+
     /// Get the recommended baseline offset for the given font and line height.
     pub fn baseline_offset(
         &self,
