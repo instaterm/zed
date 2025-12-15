@@ -575,6 +575,7 @@ impl LineLayoutCache {
                         glyph_pos += 1;
                     }
                 }
+                layout.width = glyph_pos * force_width;
             }
 
             let key = Arc::new(CacheKey {
