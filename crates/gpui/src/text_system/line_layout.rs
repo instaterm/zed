@@ -1,3 +1,60 @@
+// =====================================================================
+// FORK NOTE — instaterm/zed only (branch: v1.2.x)
+// =====================================================================
+// This file carries an additive `ShapeLineOptions` API for grid-aligned
+// glyph snapping (used by instaterm's terminal renderer to keep
+// ligatures, emoji clusters, and multi-byte UTF-8 graphemes correctly
+// aligned to a forced cell grid). The upstream gpui has no equivalent.
+//
+// What was added (look for these on rebase):
+//   - `SnapMode` / `SnapModeRef` / `ShapeLineOptions` / `ShapeLineOptions::normalized()`
+//     near the top of this file. Pure additions, low conflict risk.
+//   - `snap_byte_to_column()` helper, applied as an extra pass AFTER
+//     upstream's `apply_force_width_to_layout` to relocate ligature /
+//     cluster glyphs to byte-derived columns. For `SnapMode::GlyphIndex`
+//     (the default) we rely entirely on the upstream helper, which
+//     already handles combining marks correctly.
+//   - `apply_force_width_to_layout` had `layout.width = glyph_pos *
+//     force_width;` appended (upstream omits this — the previous
+//     `b8f05230` / `b7d66763` private fixes are now a one-line tail).
+//   - `_with` siblings on `LineLayoutCache`: `layout_line_with`,
+//     `try_layout_line_with_by_hash`, `layout_line_with_by_hash`. The
+//     legacy `layout_line` delegates to `layout_line_with` with default
+//     options. The legacy `*_by_hash` cache wrappers were deleted —
+//     `WindowTextSystem::*_by_hash` calls `*_with_by_hash` directly.
+//
+// High-conflict areas on upstream rebase:
+//   1. `CacheKey`/`CacheKeyRef`/`HashedCacheKey`/`HashedCacheKeyRef` —
+//      we added `snap_tolerance: Pixels` and `snap_mode: SnapMode`
+//      (owned) / `SnapModeRef<'a>` (borrowed). Every struct literal
+//      that builds these keys (in `layout_wrapped_line`,
+//      `layout_line_with`, `try_layout_line_with_by_hash`,
+//      `layout_line_with_by_hash`, `as_cache_key_ref`, `to_ref`) needs
+//      the new fields. If upstream adds/removes a field, mirror into
+//      ALL of those sites.
+//   2. The `Hash`/`PartialEq` impls for `HashedCacheKey` /
+//      `HashedCacheKeyRef` were converted from inline field-by-field
+//      to delegate via `to_ref()`. Keep this shape — it's why the
+//      borrowed/owned forms produce identical hashes.
+//
+// Cache-key invariants (preserve these on rebase):
+//   - `SnapModeRef` MUST stay `Copy` so `CacheKeyRef` stays `Copy`
+//     (probe paths run per-row per-frame in the terminal renderer).
+//     `SnapMode::ByteToColumn` holds an `Arc<[u32]>` — cheap to clone,
+//     hashes by slice contents not pointer identity.
+//   - `ShapeLineOptions::normalized()` MUST be called before building
+//     a cache key, so `force_width = None` collapses snap fields to
+//     defaults (otherwise cache hits fragment on irrelevant inputs).
+//
+// Public API surface (deliberately narrow — keep it that way):
+//   - Public: `SnapMode`, `ShapeLineOptions` (this file);
+//     `WindowTextSystem::shape_line_with` (text_system.rs).
+//   - `pub(crate)` only: `SnapModeRef`, all other `_with` methods on
+//     `WindowTextSystem` and `LineLayoutCache`. instaterm only uses
+//     `shape_line_with`.
+//
+// =====================================================================
+
 use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
@@ -10,6 +67,179 @@ use std::{
 };
 
 use super::LineWrapper;
+
+/// How glyphs snap onto the forced grid when `force_width` is set.
+#[derive(Clone, Debug)]
+pub enum SnapMode {
+    /// Snap glyph N to `N × force_width`. Correct when 1 glyph = 1 column
+    /// (no ligatures or contextual substitutions that fuse multiple input
+    /// positions into one glyph). This is the legacy behaviour.
+    GlyphIndex,
+    /// Snap a glyph whose source starts at byte B to
+    /// `byte_to_column[B] × force_width`. The table must have length
+    /// `text.len() + 1`; the last entry is the total column count, used
+    /// to compute `layout.width = byte_to_column[text.len()] × force_width`.
+    ///
+    /// "Column" here means one `force_width` stride — gpui has no opinion
+    /// on what one stride represents to the caller. Two valid usages:
+    ///
+    /// - **Uniform grid:** `force_width` = per-cell pixel width; the table
+    ///   tracks per-cell ordinals (`[0, 1, 1, 2, ..]` for `"a你b"` where
+    ///   `你` spans columns 1–2 → byte_to_column maps `你`'s 3 bytes to 1).
+    /// - **Mixed-width grid:** caller splits text into per-stride spans
+    ///   (one span per width class) and treats each span's stride as one
+    ///   column. A terminal renderer with width-2 CJK cells uses
+    ///   `force_width = 2 × base_cell_width` for its CJK spans and tracks
+    ///   stride ordinals (sentinel `n` for `n` width-2 cells, not `2n`).
+    ///
+    /// Use this whenever source bytes and output columns are not in 1:1
+    /// correspondence — ligatures, emoji clusters, multi-byte UTF-8
+    /// graphemes.
+    ByteToColumn {
+        /// Byte offset → column ordinal. See variant docs.
+        byte_to_column: Arc<[u32]>,
+    },
+}
+
+impl SnapMode {
+    fn as_ref(&self) -> SnapModeRef<'_> {
+        match self {
+            SnapMode::GlyphIndex => SnapModeRef::GlyphIndex,
+            SnapMode::ByteToColumn { byte_to_column } => {
+                SnapModeRef::ByteToColumn { byte_to_column }
+            }
+        }
+    }
+}
+
+impl PartialEq for SnapMode {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for SnapMode {}
+
+impl Hash for SnapMode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
+
+/// Borrowed sibling of [`SnapMode`], used in cache probe keys to keep them `Copy`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SnapModeRef<'a> {
+    GlyphIndex,
+    ByteToColumn { byte_to_column: &'a [u32] },
+}
+
+impl PartialEq for SnapModeRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SnapModeRef::GlyphIndex, SnapModeRef::GlyphIndex) => true,
+            (
+                SnapModeRef::ByteToColumn { byte_to_column: a },
+                SnapModeRef::ByteToColumn { byte_to_column: b },
+            ) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SnapModeRef<'_> {}
+
+impl Hash for SnapModeRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            SnapModeRef::GlyphIndex => {
+                0u8.hash(state);
+            }
+            SnapModeRef::ByteToColumn { byte_to_column } => {
+                1u8.hash(state);
+                byte_to_column.hash(state);
+            }
+        }
+    }
+}
+
+/// Options controlling glyph snapping when shaping a line with a forced column grid.
+///
+/// The default value matches the legacy `shape_line(.., force_width = None)` behaviour:
+/// no snapping, 1px tolerance, `GlyphIndex` snap mode.
+///
+/// Note: when `force_width` is `None`, `snap_tolerance` and `snap_mode` have no effect
+/// on the resulting layout. `ShapeLineOptions` is normalized at each entry point so
+/// non-default values in that case collapse to defaults for cache-key purposes —
+/// cache hits therefore don't fragment on those irrelevant fields.
+#[derive(Clone, Debug)]
+pub struct ShapeLineOptions {
+    /// If set, glyphs are snapped onto a grid of this width. `None` means no snap.
+    pub force_width: Option<Pixels>,
+    /// Glyphs only snap if their natural position differs from the target by more
+    /// than this tolerance. Legacy behaviour is `px(1.)`.
+    pub snap_tolerance: Pixels,
+    /// How the snap target column is derived. See [`SnapMode`].
+    pub snap_mode: SnapMode,
+}
+
+impl Default for ShapeLineOptions {
+    fn default() -> Self {
+        Self {
+            force_width: None,
+            snap_tolerance: px(1.),
+            snap_mode: SnapMode::GlyphIndex,
+        }
+    }
+}
+
+impl ShapeLineOptions {
+    /// Normalize to a canonical form for cache keying. When `force_width` is `None`
+    /// the snap loop is skipped entirely, so `snap_tolerance` and `snap_mode`
+    /// cannot influence the resulting layout — collapse them to defaults so cache
+    /// hits are maximised.
+    pub(crate) fn normalized(mut self) -> Self {
+        if self.force_width.is_none() {
+            self.snap_tolerance = px(1.);
+            self.snap_mode = SnapMode::GlyphIndex;
+        }
+        self
+    }
+}
+
+// Run AFTER `apply_force_width_to_layout` for `SnapMode::ByteToColumn`. The base
+// pass aligns each glyph to a `glyph_pos * force_width` grid (and handles
+// combining marks); this pass overrides that for callers that need glyphs to
+// land at the column where their first source byte starts — i.e. ligatures and
+// emoji clusters whose single glyph spans multiple input cells. Updates
+// `layout.width` to `byte_to_column[text_len] * force_width` so the line width
+// matches the cell-width sum.
+fn snap_byte_to_column(
+    layout: &mut LineLayout,
+    force_width: Pixels,
+    snap_tolerance: Pixels,
+    byte_to_column: &Arc<[u32]>,
+    text_len: usize,
+) {
+    debug_assert_eq!(
+        byte_to_column.len(),
+        text_len + 1,
+        "byte_to_column must have exactly text.len() + 1 entries (one per byte plus a sentinel)",
+    );
+    debug_assert!(
+        byte_to_column.windows(2).all(|w| w[0] <= w[1]),
+        "byte_to_column must be monotonically non-decreasing",
+    );
+
+    for run in layout.runs.iter_mut() {
+        for glyph in run.glyphs.iter_mut() {
+            let target_x: Pixels = byte_to_column[glyph.index] as f32 * force_width;
+            if (glyph.position.x - target_x).abs() > snap_tolerance {
+                glyph.position.x = target_x;
+            }
+        }
+    }
+    layout.width = byte_to_column[text_len] as f32 * force_width;
+}
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -527,6 +757,8 @@ impl LineLayoutCache {
             runs,
             wrap_width,
             force_width: None,
+            snap_tolerance: px(1.),
+            snap_mode: SnapModeRef::GlyphIndex,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -562,6 +794,8 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
+                snap_tolerance: px(1.),
+                snap_mode: SnapMode::GlyphIndex,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -585,12 +819,37 @@ impl LineLayoutCache {
         Text: AsRef<str>,
         SharedString: From<Text>,
     {
+        self.layout_line_with(
+            text,
+            font_size,
+            runs,
+            ShapeLineOptions {
+                force_width,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn layout_line_with<Text>(
+        &self,
+        text: Text,
+        font_size: Pixels,
+        runs: &[FontRun],
+        opts: ShapeLineOptions,
+    ) -> Arc<LineLayout>
+    where
+        Text: AsRef<str>,
+        SharedString: From<Text>,
+    {
+        let opts = opts.normalized();
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
             runs,
             wrap_width: None,
-            force_width,
+            force_width: opts.force_width,
+            snap_tolerance: opts.snap_tolerance,
+            snap_mode: opts.snap_mode.as_ref(),
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -609,8 +868,17 @@ impl LineLayoutCache {
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
 
-            if let Some(force_width) = force_width {
+            if let Some(force_width) = opts.force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
+                if let SnapMode::ByteToColumn { byte_to_column } = &opts.snap_mode {
+                    snap_byte_to_column(
+                        &mut layout,
+                        force_width,
+                        opts.snap_tolerance,
+                        byte_to_column,
+                        text.len(),
+                    );
+                }
             }
 
             let key = Arc::new(CacheKey {
@@ -618,7 +886,9 @@ impl LineLayoutCache {
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width: None,
-                force_width,
+                force_width: opts.force_width,
+                snap_tolerance: opts.snap_tolerance,
+                snap_mode: opts.snap_mode,
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -635,48 +905,42 @@ impl LineLayoutCache {
     /// Contract (caller enforced):
     /// - Same `text_hash` implies identical text content (collision risk accepted by caller).
     /// - `text_len` should be the UTF-8 byte length of the text (helps reduce accidental collisions).
-    pub fn try_layout_line_by_hash(
+    pub fn try_layout_line_with_by_hash(
         &self,
         text_hash: u64,
         text_len: usize,
         font_size: Pixels,
         runs: &[FontRun],
-        force_width: Option<Pixels>,
+        opts: ShapeLineOptions,
     ) -> Option<Arc<LineLayout>> {
+        let opts = opts.normalized();
+        let snap_mode_ref = opts.snap_mode.as_ref();
         let key_ref = HashedCacheKeyRef {
             text_hash,
             text_len,
             font_size,
             runs,
             wrap_width: None,
-            force_width,
+            force_width: opts.force_width,
+            snap_tolerance: opts.snap_tolerance,
+            snap_mode: snap_mode_ref,
         };
 
         let current_frame = self.current_frame.read();
-        if let Some((_, layout)) = current_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
+        if let Some((_, layout)) = current_frame
+            .lines_by_hash
+            .iter()
+            .find(|(key, _)| key.to_ref() == key_ref)
+        {
             return Some(layout.clone());
         }
 
         let previous_frame = self.previous_frame.lock();
-        if let Some((_, layout)) = previous_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
+        if let Some((_, layout)) = previous_frame
+            .lines_by_hash
+            .iter()
+            .find(|(key, _)| key.to_ref() == key_ref)
+        {
             return Some(layout.clone());
         }
 
@@ -691,36 +955,35 @@ impl LineLayoutCache {
     /// Contract (caller enforced):
     /// - Same `text_hash` implies identical text content (collision risk accepted by caller).
     /// - `text_len` should be the UTF-8 byte length of the text (helps reduce accidental collisions).
-    pub fn layout_line_by_hash(
+    pub fn layout_line_with_by_hash(
         &self,
         text_hash: u64,
         text_len: usize,
         font_size: Pixels,
         runs: &[FontRun],
-        force_width: Option<Pixels>,
+        opts: ShapeLineOptions,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
+        let opts = opts.normalized();
+        let snap_mode_ref = opts.snap_mode.as_ref();
         let key_ref = HashedCacheKeyRef {
             text_hash,
             text_len,
             font_size,
             runs,
             wrap_width: None,
-            force_width,
+            force_width: opts.force_width,
+            snap_tolerance: opts.snap_tolerance,
+            snap_mode: snap_mode_ref,
         };
 
         // Fast path: already cached (no allocation).
         let current_frame = self.current_frame.upgradable_read();
-        if let Some((_, layout)) = current_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
+        if let Some((_, layout)) = current_frame
+            .lines_by_hash
+            .iter()
+            .find(|(key, _)| key.to_ref() == key_ref)
+        {
             return layout.clone();
         }
 
@@ -732,16 +995,7 @@ impl LineLayoutCache {
         if let Some(existing_key) = previous_frame
             .used_lines_by_hash
             .iter()
-            .find(|key| {
-                HashedCacheKeyRef {
-                    text_hash: key.text_hash,
-                    text_len: key.text_len,
-                    font_size: key.font_size,
-                    runs: key.runs.as_slice(),
-                    wrap_width: key.wrap_width,
-                    force_width: key.force_width,
-                } == key_ref
-            })
+            .find(|key| key.to_ref() == key_ref)
             .cloned()
         {
             if let Some((key, layout)) = previous_frame.lines_by_hash.remove_entry(&existing_key) {
@@ -758,8 +1012,17 @@ impl LineLayoutCache {
             .platform_text_system
             .layout_line(&text, font_size, runs);
 
-        if let Some(force_width) = force_width {
+        if let Some(force_width) = opts.force_width {
             apply_force_width_to_layout(&mut layout, force_width);
+            if let SnapMode::ByteToColumn { byte_to_column } = &opts.snap_mode {
+                snap_byte_to_column(
+                    &mut layout,
+                    force_width,
+                    opts.snap_tolerance,
+                    byte_to_column,
+                    text.len(),
+                );
+            }
         }
 
         let key = Arc::new(HashedCacheKey {
@@ -768,7 +1031,9 @@ impl LineLayoutCache {
             font_size,
             runs: SmallVec::from(runs),
             wrap_width: None,
-            force_width,
+            force_width: opts.force_width,
+            snap_tolerance: opts.snap_tolerance,
+            snap_mode: opts.snap_mode,
         });
         let layout = Arc::new(layout);
         current_frame
@@ -807,6 +1072,12 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
             }
         }
     }
+    // FORK: upstream's helper aligns glyph positions to the forced grid but
+    // leaves `layout.width` at the shaped natural width, which leaves the
+    // grid-aligned tail glyphs off the right edge of the line. Set the line
+    // width to the cell-count × cell-width so renderers (terminal grid, span
+    // truncation) see the actual painted footprint.
+    layout.width = glyph_pos as f32 * force_width;
 }
 
 /// A run of text with a single font.
@@ -828,6 +1099,8 @@ struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    snap_tolerance: Pixels,
+    snap_mode: SnapMode,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -837,6 +1110,8 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    snap_tolerance: Pixels,
+    snap_mode: SnapModeRef<'a>,
 }
 
 #[derive(Clone, Debug)]
@@ -847,6 +1122,8 @@ struct HashedCacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    snap_tolerance: Pixels,
+    snap_mode: SnapMode,
 }
 
 #[derive(Copy, Clone)]
@@ -857,6 +1134,8 @@ struct HashedCacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    snap_tolerance: Pixels,
+    snap_mode: SnapModeRef<'a>,
 }
 
 impl PartialEq for dyn AsCacheKeyRef + '_ {
@@ -865,14 +1144,24 @@ impl PartialEq for dyn AsCacheKeyRef + '_ {
     }
 }
 
+impl HashedCacheKey {
+    fn to_ref(&self) -> HashedCacheKeyRef<'_> {
+        HashedCacheKeyRef {
+            text_hash: self.text_hash,
+            text_len: self.text_len,
+            font_size: self.font_size,
+            runs: self.runs.as_slice(),
+            wrap_width: self.wrap_width,
+            force_width: self.force_width,
+            snap_tolerance: self.snap_tolerance,
+            snap_mode: self.snap_mode.as_ref(),
+        }
+    }
+}
+
 impl PartialEq for HashedCacheKey {
     fn eq(&self, other: &Self) -> bool {
-        self.text_hash == other.text_hash
-            && self.text_len == other.text_len
-            && self.font_size == other.font_size
-            && self.runs.as_slice() == other.runs.as_slice()
-            && self.wrap_width == other.wrap_width
-            && self.force_width == other.force_width
+        self.to_ref() == other.to_ref()
     }
 }
 
@@ -880,12 +1169,7 @@ impl Eq for HashedCacheKey {}
 
 impl Hash for HashedCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.text_hash.hash(state);
-        self.text_len.hash(state);
-        self.font_size.hash(state);
-        self.runs.as_slice().hash(state);
-        self.wrap_width.hash(state);
-        self.force_width.hash(state);
+        self.to_ref().hash(state);
     }
 }
 
@@ -897,6 +1181,8 @@ impl PartialEq for HashedCacheKeyRef<'_> {
             && self.runs == other.runs
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
+            && self.snap_tolerance == other.snap_tolerance
+            && self.snap_mode == other.snap_mode
     }
 }
 
@@ -910,6 +1196,8 @@ impl Hash for HashedCacheKeyRef<'_> {
         self.runs.hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
+        self.snap_tolerance.hash(state);
+        self.snap_mode.hash(state);
     }
 }
 
@@ -929,6 +1217,8 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
+            snap_tolerance: self.snap_tolerance,
+            snap_mode: self.snap_mode.as_ref(),
         }
     }
 }
@@ -1002,6 +1292,7 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0., 8., 16.]);
+        assert_eq!(layout.width, px(24.));
     }
 
     #[test]
@@ -1028,6 +1319,8 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0., 0., 8.]);
+        // Only 2 bases (combining mark doesn't advance grid).
+        assert_eq!(layout.width, px(16.));
     }
 
     #[test]
@@ -1074,5 +1367,99 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn snap_byte_to_column_ligature() {
+        // Simulated `==` ligature: 1 glyph spanning 2 bytes (2 columns),
+        // followed by one glyph at byte index 2.
+        // byte_to_column: [0, 1, 2, 3] — byte 0 → column 0, byte 2 → column 2.
+        // force_width = 7px, text_len = 3.
+        let column_width = px(7.);
+        let mut layout = make_layout(vec![
+            glyph_at(0.0, 0),   // ligature glyph at byte 0
+            glyph_at(14.45, 2), // next glyph at byte 2, natural advance ~14.45
+        ]);
+        layout.len = 3;
+        let byte_to_column: Arc<[u32]> = Arc::from(vec![0, 1, 2, 3]);
+        snap_byte_to_column(&mut layout, column_width, px(0.), &byte_to_column, 3);
+        let positions = glyph_x_positions(&layout);
+        // Glyph 0 → byte 0 → column 0; glyph 1 → byte 2 → column 2 → 14.
+        assert_eq!(positions, vec![0., 14.]);
+        // layout.width = byte_to_column[text_len] × column_width = 3 × 7 = 21.
+        assert_eq!(layout.width, px(21.));
+    }
+
+    #[test]
+    fn snap_byte_to_column_multi_byte_non_ascii() {
+        // Text "éa": `é` = 2 bytes (width-1 column), `a` = 1 byte (width-1 column).
+        // byte_to_column = [0, 0, 1, 2]: both bytes of `é` map to column 0, `a` byte to column 1.
+        // text_len = 3, column_width = 7px.
+        let column_width = px(7.);
+        let mut layout = make_layout(vec![
+            glyph_at(0.0, 0),  // `é` glyph at byte 0 → column 0
+            glyph_at(7.22, 2), // `a` glyph at byte 2 → column 1
+        ]);
+        layout.len = 3;
+        let byte_to_column: Arc<[u32]> = Arc::from(vec![0, 0, 1, 2]);
+        snap_byte_to_column(&mut layout, column_width, px(0.), &byte_to_column, 3);
+        let positions = glyph_x_positions(&layout);
+        assert_eq!(positions, vec![0., 7.]);
+        assert_eq!(layout.width, px(14.)); // byte_to_column[3] × 7 = 2 × 7
+    }
+
+    #[test]
+    fn snap_byte_to_column_wide_multi_glyph_cluster() {
+        // Uniform-grid usage: 3 glyphs for a 12-byte cluster (e.g. emoji ZWJ)
+        // that spans 2 unit-width columns. force_width = base column width (7),
+        // table = [0; 12] + sentinel 2. All 3 glyphs land at x = 0.
+        // layout.width = 2 × 7 = 14.
+        let column_width = px(7.);
+        let mut layout = make_layout(vec![glyph_at(0.0, 0), glyph_at(20.0, 4), glyph_at(40.0, 8)]);
+        layout.len = 12;
+        let mut table = vec![0u32; 12];
+        table.push(2);
+        let byte_to_column: Arc<[u32]> = Arc::from(table);
+        snap_byte_to_column(&mut layout, column_width, px(0.), &byte_to_column, 12);
+        let positions = glyph_x_positions(&layout);
+        assert_eq!(positions, vec![0., 0., 0.]);
+        assert_eq!(layout.width, px(14.));
+    }
+
+    #[test]
+    fn shape_line_options_normalized_collapses_when_force_width_none() {
+        // Non-default snap fields with force_width=None must collapse to defaults
+        // so cache hits aren't fragmented on irrelevant fields.
+        let byte_to_column: Arc<[u32]> = Arc::from(vec![0, 1, 2]);
+        let opts = ShapeLineOptions {
+            force_width: None,
+            snap_tolerance: px(0.),
+            snap_mode: SnapMode::ByteToColumn { byte_to_column },
+        };
+        let normalized = opts.normalized();
+        assert_eq!(normalized.force_width, None);
+        assert_eq!(normalized.snap_tolerance, px(1.));
+        assert!(matches!(normalized.snap_mode, SnapMode::GlyphIndex));
+
+        // Force-width set: snap fields are preserved.
+        let byte_to_column: Arc<[u32]> = Arc::from(vec![0, 1, 2]);
+        let opts = ShapeLineOptions {
+            force_width: Some(px(7.)),
+            snap_tolerance: px(0.),
+            snap_mode: SnapMode::ByteToColumn {
+                byte_to_column: byte_to_column.clone(),
+            },
+        };
+        let normalized = opts.normalized();
+        assert_eq!(normalized.force_width, Some(px(7.)));
+        assert_eq!(normalized.snap_tolerance, px(0.));
+        match normalized.snap_mode {
+            SnapMode::ByteToColumn {
+                byte_to_column: got,
+            } => {
+                assert_eq!(&got[..], &byte_to_column[..]);
+            }
+            _ => panic!("snap_mode was not preserved"),
+        }
     }
 }
