@@ -1,3 +1,33 @@
+// =====================================================================
+// FORK NOTE — instaterm/zed only (branch: 0.232.x-shape-line-options)
+// =====================================================================
+// This file adds `_with` siblings to several `WindowTextSystem` methods.
+// Full design + invariants live at the top of `line_layout.rs`; read
+// that first. This note covers what's specific to this file.
+//
+// Methods added on `WindowTextSystem`:
+//   - `shape_line_with`            — PUBLIC. Instaterm's terminal
+//                                    renderer is the only caller.
+//   - `shape_line_with_by_hash`    — pub(crate)
+//   - `layout_line_with`           — pub(crate)
+//   - `try_layout_line_with_by_hash` — pub(crate)
+//   - `layout_line_with_by_hash`   — pub(crate)
+//
+// The four pub(crate) ones exist solely so the legacy methods
+// (`shape_line`, `shape_line_by_hash`, `layout_line`,
+// `try_layout_line_by_hash`, `layout_line_by_hash`) can delegate
+// uniformly. They have no external callers.
+//
+// On rebase from upstream:
+//   - All legacy methods delegate to their `_with` siblings via
+//     `ShapeLineOptions { force_width, ..Default::default() }`.
+//     Preserve this delegation. If upstream changes a legacy method's
+//     body, port the change into the `_with` sibling (single source
+//     of truth) rather than reverting.
+//   - Don't widen `pub(crate)` to `pub` without a real external
+//     caller — the public API surface is the merge-conflict surface.
+// =====================================================================
+
 mod font_fallbacks;
 mod font_features;
 mod line;
@@ -416,6 +446,27 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> ShapedLine {
+        self.shape_line_with(
+            text,
+            font_size,
+            runs,
+            ShapeLineOptions {
+                force_width,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Like [`Self::shape_line`], but takes a [`ShapeLineOptions`] that controls
+    /// the glyph snapping behaviour when `force_width` is set. The legacy method
+    /// forwards here with `snap_tolerance = px(1.)` and `snap_mode = GlyphIndex`.
+    pub fn shape_line_with(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        opts: ShapeLineOptions,
+    ) -> ShapedLine {
         debug_assert!(
             text.find('\n').is_none(),
             "text argument should not contain newlines"
@@ -441,7 +492,7 @@ impl WindowTextSystem {
             });
         }
 
-        let layout = self.layout_line(&text, font_size, runs, force_width);
+        let layout = self.layout_line_with(&text, font_size, runs, opts);
 
         ShapedLine {
             layout,
@@ -469,6 +520,30 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> ShapedLine {
+        self.shape_line_with_by_hash(
+            text_hash,
+            text_len,
+            font_size,
+            runs,
+            ShapeLineOptions {
+                force_width,
+                ..Default::default()
+            },
+            materialize_text,
+        )
+    }
+
+    /// Like [`Self::shape_line_by_hash`], but takes [`ShapeLineOptions`] for snap
+    /// behaviour control.
+    pub(crate) fn shape_line_with_by_hash(
+        &self,
+        text_hash: u64,
+        text_len: usize,
+        font_size: Pixels,
+        runs: &[TextRun],
+        opts: ShapeLineOptions,
+        materialize_text: impl FnOnce() -> SharedString,
+    ) -> ShapedLine {
         let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
         for run in runs {
             if let Some(last_run) = decoration_runs.last_mut()
@@ -489,22 +564,15 @@ impl WindowTextSystem {
             });
         }
 
-        let mut used_force_width = force_width;
-        let layout = self.layout_line_by_hash(
-            text_hash,
-            text_len,
-            font_size,
-            runs,
-            used_force_width,
-            || {
+        let layout =
+            self.layout_line_with_by_hash(text_hash, text_len, font_size, runs, opts, || {
                 let text = materialize_text();
                 debug_assert!(
                     text.find('\n').is_none(),
                     "text argument should not contain newlines"
                 );
                 text
-            },
-        );
+            });
 
         // We only materialize actual text on cache miss; on hit we avoid allocations.
         // Since `ShapedLine` carries a `SharedString`, use an empty placeholder for hits.
@@ -664,6 +732,26 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout> {
+        self.layout_line_with(
+            text,
+            font_size,
+            runs,
+            ShapeLineOptions {
+                force_width,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Like [`Self::layout_line`], but takes a [`ShapeLineOptions`] to control
+    /// glyph snapping when `force_width` is set.
+    pub(crate) fn layout_line_with(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[TextRun],
+        opts: ShapeLineOptions,
+    ) -> Arc<LineLayout> {
         let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
         font_runs.clear();
@@ -696,11 +784,11 @@ impl WindowTextSystem {
             }
         }
 
-        let layout = self.line_layout_cache.layout_line(
+        let layout = self.line_layout_cache.layout_line_with(
             &SharedString::new(text),
             font_size,
             &font_runs,
-            force_width,
+            opts,
         );
 
         self.font_runs_pool.lock().push(font_runs);
@@ -723,6 +811,27 @@ impl WindowTextSystem {
         font_size: Pixels,
         runs: &[TextRun],
         force_width: Option<Pixels>,
+    ) -> Option<Arc<LineLayout>> {
+        self.try_layout_line_with_by_hash(
+            text_hash,
+            text_len,
+            font_size,
+            runs,
+            ShapeLineOptions {
+                force_width,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Like [`Self::try_layout_line_by_hash`], but takes [`ShapeLineOptions`].
+    pub(crate) fn try_layout_line_with_by_hash(
+        &self,
+        text_hash: u64,
+        text_len: usize,
+        font_size: Pixels,
+        runs: &[TextRun],
+        opts: ShapeLineOptions,
     ) -> Option<Arc<LineLayout>> {
         let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
@@ -756,13 +865,9 @@ impl WindowTextSystem {
             }
         }
 
-        let layout = self.line_layout_cache.try_layout_line_by_hash(
-            text_hash,
-            text_len,
-            font_size,
-            &font_runs,
-            force_width,
-        );
+        let layout = self
+            .line_layout_cache
+            .try_layout_line_with_by_hash(text_hash, text_len, font_size, &font_runs, opts);
 
         self.font_runs_pool.lock().push(font_runs);
 
@@ -784,6 +889,29 @@ impl WindowTextSystem {
         font_size: Pixels,
         runs: &[TextRun],
         force_width: Option<Pixels>,
+        materialize_text: impl FnOnce() -> SharedString,
+    ) -> Arc<LineLayout> {
+        self.layout_line_with_by_hash(
+            text_hash,
+            text_len,
+            font_size,
+            runs,
+            ShapeLineOptions {
+                force_width,
+                ..Default::default()
+            },
+            materialize_text,
+        )
+    }
+
+    /// Like [`Self::layout_line_by_hash`], but takes [`ShapeLineOptions`].
+    pub(crate) fn layout_line_with_by_hash(
+        &self,
+        text_hash: u64,
+        text_len: usize,
+        font_size: Pixels,
+        runs: &[TextRun],
+        opts: ShapeLineOptions,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
         let mut last_run = None::<&TextRun>;
@@ -818,12 +946,12 @@ impl WindowTextSystem {
             }
         }
 
-        let layout = self.line_layout_cache.layout_line_by_hash(
+        let layout = self.line_layout_cache.layout_line_with_by_hash(
             text_hash,
             text_len,
             font_size,
             &font_runs,
-            force_width,
+            opts,
             materialize_text,
         );
 
