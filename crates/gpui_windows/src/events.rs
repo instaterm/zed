@@ -61,7 +61,7 @@ impl WindowsWindowInner {
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
-            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
+            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(handle),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
             // Treat double click as a second single click, since we track the double clicks ourselves.
             // If you don't interact with any elements, this will fall through to the windows default
@@ -329,7 +329,7 @@ impl WindowsWindowInner {
         if handled { Some(0) } else { Some(1) }
     }
 
-    fn handle_mouse_leave_msg(&self) -> Option<isize> {
+    fn handle_mouse_leave_msg(&self, handle: HWND) -> Option<isize> {
         self.state.hovered.set(false);
         // The next window's `WM_SETCURSOR` picks its own cursor, so we just clear
         // the flag for tight `is_cursor_visible()` semantics.
@@ -340,6 +340,44 @@ impl WindowsWindowInner {
                 .callbacks
                 .hovered_status_change
                 .set(Some(callback));
+        }
+
+        // Synthesize a MouseMove to an off-window position so the element tree's
+        // hit-test goes empty and any sticky `.hover()` styles deactivate. WM_(NC)MOUSELEAVE
+        // doesn't otherwise update `Window::mouse_position`, and `.hover()` listeners
+        // re-test the hitbox against that position on every MouseMove — they never
+        // get a chance to clear when the cursor exits the window via a non-client
+        // area like a caption button (where no subsequent WM_MOUSEMOVE arrives).
+        //
+        // Gate this on "the cursor is actually outside our window": WM_MOUSELEAVE
+        // also fires when the cursor merely crosses from client into non-client
+        // (and WM_NCMOUSELEAVE vice versa), and in those cases the very next
+        // WM_(NC)MOUSEMOVE will update mouse_position naturally — synthesizing
+        // here would just produce a hover-OFF/ON flicker at every boundary cross.
+        //
+        // `pressed_button: None` is intentional: drag-style consumers typically
+        // gate on `pressed_button == Some(_)`, so this synthesis is harmless to
+        // an in-flight drag. Callers that don't gate will observe a one-off
+        // MouseMove at (-1, -1); add gating if that becomes a problem.
+        //
+        // GetAncestor(..., GA_ROOT) normalizes child / owned popup HWNDs (IME
+        // candidates, tooltips, DirectComposition helpers) up to our top-level
+        // window — a plain `WindowFromPoint != handle` would treat those as
+        // "cursor left" and flicker the hover state.
+        let cursor_left_window = unsafe {
+            let mut point = POINT::default();
+            GetCursorPos(&mut point).is_ok()
+                && GetAncestor(WindowFromPoint(point), GA_ROOT) != handle
+        };
+        if cursor_left_window && let Some(mut func) = self.state.callbacks.input.take() {
+            let scale_factor = self.state.scale_factor.get();
+            let input = PlatformInput::MouseMove(MouseMoveEvent {
+                position: logical_point(-1.0, -1.0, scale_factor),
+                pressed_button: None,
+                modifiers: current_modifiers(),
+            });
+            func(input);
+            self.state.callbacks.input.set(Some(func));
         }
 
         Some(0)
@@ -870,16 +908,18 @@ impl WindowsWindowInner {
                 .callbacks
                 .hit_test_window_control
                 .set(Some(callback));
-            if let Some(area) = area {
-                match area {
-                    WindowControlArea::Drag => Some(HTCAPTION as _),
-                    WindowControlArea::Close => return Some(HTCLOSE as _),
-                    WindowControlArea::Max => return Some(HTMAXBUTTON as _),
-                    WindowControlArea::Min => return Some(HTMINBUTTON as _),
-                }
-            } else {
-                None
-            }
+            // All caption-button areas fall through to the resize-frame check below
+            // (rather than returning here), so the OS-standard ~frame_y top edge
+            // yields HTTOP/HTTOPRIGHT/HTTOPLEFT even when it visually overlaps a
+            // minimize / maximize / close button. This matches Windows Terminal and
+            // standard Win11 chrome: caption buttons that reach the window's top
+            // edge still expose the resize frame on their top few pixels.
+            area.map(|area| match area {
+                WindowControlArea::Drag => HTCAPTION as isize,
+                WindowControlArea::Close => HTCLOSE as isize,
+                WindowControlArea::Max => HTMAXBUTTON as isize,
+                WindowControlArea::Min => HTMINBUTTON as isize,
+            })
         } else {
             None
         };
