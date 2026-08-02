@@ -949,6 +949,18 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow().sprite_atlas()
     }
 
+    /// Unlike [`PlatformWindow::draw`], failures are returned rather than
+    /// logged: a caller asking for an image has nothing to fall back on, and a
+    /// capture that quietly produced nothing would be indistinguishable from
+    /// one that produced a stale frame.
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&self, scene: &Scene) -> Result<image::RgbaImage> {
+        self.state
+            .renderer
+            .borrow_mut()
+            .render_to_image(scene, self.state.background_appearance.get())
+    }
+
     fn get_raw_handle(&self) -> HWND {
         self.0.hwnd
     }

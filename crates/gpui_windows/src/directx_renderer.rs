@@ -103,6 +103,20 @@ struct DirectComposition {
     comp_visual: IDCompositionVisual,
 }
 
+/// Whether a scene submission actually reached the render target.
+///
+/// The frame right after a device-lost recovery is deliberately dropped (see
+/// [`DirectXRenderer::skip_draws`]), which leaves the back buffer holding
+/// whatever happened to be there before. Presentation can simply wait for the
+/// next frame, but a caller that reads the back buffer back must not mistake
+/// that stale content for a freshly rendered one — so this is reported instead
+/// of being folded into a plain `Ok(())`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SceneSubmission {
+    Drawn,
+    SkippedAfterDeviceLoss,
+}
+
 impl DirectXRendererDevices {
     pub(crate) fn new(
         directx_devices: &DirectXDevices,
@@ -306,10 +320,29 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        match self.submit_scene(scene, background_appearance)? {
+            SceneSubmission::Drawn => self.present(),
+            // Nothing reached the render target, so there is nothing to put on
+            // screen. The next frame draws normally.
+            SceneSubmission::SkippedAfterDeviceLoss => Ok(()),
+        }
+    }
+
+    /// Render one scene into the current render target, without presenting it.
+    ///
+    /// Shared by ordinary presentation and by `render_to_image`, so both go
+    /// through the same shaders, atlas, clipping, blending and background
+    /// handling rather than growing a second renderer. Splitting `Present` out
+    /// is the only difference between the two callers.
+    fn submit_scene(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<SceneSubmission> {
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
-            return Ok(());
+            return Ok(SceneSubmission::SkippedAfterDeviceLoss);
         }
         self.pre_draw(&match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
@@ -352,7 +385,113 @@ impl DirectXRenderer {
                 scene.surfaces.len(),
             ))?;
         }
-        self.present()
+        Ok(SceneSubmission::Drawn)
+    }
+
+    /// Render one scene and read it back as an image instead of presenting it.
+    ///
+    /// Backs `PlatformWindow::render_to_image` on Windows. The scene goes
+    /// through [`Self::submit_scene`] — the same path presentation uses — so
+    /// what comes back is what would have gone on screen, and the read is of
+    /// this process's own back buffer rather than of anything the window
+    /// manager composited.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn render_to_image(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<image::RgbaImage> {
+        if self.submit_scene(scene, background_appearance)?
+            == SceneSubmission::SkippedAfterDeviceLoss
+        {
+            // The back buffer still holds whatever preceded the device loss.
+            // Handing that back would be a stale frame reported as a successful
+            // capture, so this fails instead and the caller can retry.
+            anyhow::bail!("no frame was drawn: recovering from a device-lost event");
+        }
+
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let device_context = &self
+            .devices
+            .as_ref()
+            .context("devices missing")?
+            .device_context;
+        let render_target = resources
+            .render_target
+            .as_ref()
+            .context("missing render target")?;
+
+        // Measured from the render target rather than from the renderer's own
+        // width/height, so the image can only ever describe the surface it was
+        // actually read from.
+        let mut target_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { render_target.GetDesc(&mut target_desc) };
+        let (width, height) = (target_desc.Width, target_desc.Height);
+
+        // `CopyResource` returns nothing and reports a format mismatch only to
+        // the debug layer, so without this a render target that stopped being
+        // BGRA8 would leave the staging texture untouched and hand back
+        // uninitialised memory as a successful capture. The repack below reads
+        // the bytes as BGRA too, so agreeing here is what keeps it correct.
+        anyhow::ensure!(
+            target_desc.Format == RENDER_TARGET_FORMAT,
+            "render target is {:?}, but capture reads it as {:?}",
+            target_desc.Format,
+            RENDER_TARGET_FORMAT
+        );
+
+        let staging_texture = {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: RENDER_TARGET_FORMAT,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut texture = None;
+            unsafe {
+                self.devices
+                    .as_ref()
+                    .expect("devices checked above")
+                    .device
+                    .CreateTexture2D(&desc, None, Some(&mut texture))
+            }
+            .context("Creating the capture staging texture")?;
+            texture.context("Creating the capture staging texture")?
+        };
+
+        unsafe { device_context.CopyResource(&staging_texture, render_target) };
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { device_context.Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            // Mapping for reading is also the synchronisation point: it blocks
+            // until the copy above has finished on the GPU.
+            .context("Mapping the capture staging texture")?;
+
+        // Unmapped before the result is inspected, so an error in the repack
+        // cannot leave the texture mapped — that would hold the immediate
+        // context's access to it for the rest of the process.
+        let repacked = {
+            let bytes = unsafe {
+                slice::from_raw_parts(
+                    mapped.pData as *const u8,
+                    mapped.RowPitch as usize * height as usize,
+                )
+            };
+            bgra_to_straight_rgba(bytes, mapped.RowPitch as usize, width, height)
+        };
+        unsafe { device_context.Unmap(&staging_texture, 0) };
+
+        image::RgbaImage::from_raw(width, height, repacked?)
+            .context("Assembling the captured pixels into an image")
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -752,6 +891,77 @@ impl DirectXRenderer {
     pub(crate) fn mark_drawable(&mut self) {
         self.skip_draws = false;
     }
+}
+
+/// Repack a mapped BGRA staging texture into the tightly packed, straight-alpha
+/// RGBA that [`image::RgbaImage`] holds.
+///
+/// Split out from the capture itself because both conversions here are silent
+/// when wrong and neither needs a GPU to check:
+///
+/// * **Row pitch.** The driver chooses the stride of a mapped texture and only
+///   guarantees it is at least as wide as the visible row. Treating rows as
+///   adjacent shears the image diagonally on exactly the window widths and GPUs
+///   where the two differ, and leaves it correct everywhere else.
+/// * **Premultiplied alpha.** A composition swap chain's back buffer stores
+///   colour already multiplied by alpha; PNG wants it straight. Opaque pixels
+///   are unaffected by the conversion either way, so an opaque window looks
+///   right whether or not this is done — the mistake only surfaces on a
+///   translucent one.
+#[cfg(any(test, feature = "test-support"))]
+fn bgra_to_straight_rgba(
+    mapped: &[u8],
+    row_pitch: usize,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        width > 0 && height > 0,
+        "cannot capture a {width}x{height} surface"
+    );
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .context("surface width overflows a pixel row")?;
+    anyhow::ensure!(
+        row_pitch >= row_bytes,
+        "row pitch {row_pitch} is narrower than the {row_bytes}-byte row it must hold"
+    );
+    // Checked, because everything this function is given comes from the driver
+    // or from a texture description: a wrapped product here would understate the
+    // requirement and let the copy loop below index past the mapping.
+    let required = row_pitch
+        .checked_mul(height as usize - 1)
+        .and_then(|full_rows| full_rows.checked_add(row_bytes))
+        .context("surface dimensions overflow the mapped size they would need")?;
+    anyhow::ensure!(
+        mapped.len() >= required,
+        "mapped {} bytes, but {width}x{height} at pitch {row_pitch} needs {required}",
+        mapped.len()
+    );
+
+    let mut rgba = vec![0u8; row_bytes * height as usize];
+    for y in 0..height as usize {
+        let source = &mapped[y * row_pitch..][..row_bytes];
+        let destination = &mut rgba[y * row_bytes..][..row_bytes];
+        for (source, destination) in source.chunks_exact(4).zip(destination.chunks_exact_mut(4)) {
+            let alpha = source[3];
+            let straighten = |channel: u8| match alpha {
+                // No colour to recover, and dividing by it is undefined anyway.
+                0 => 0,
+                // Already straight. Taken verbatim rather than through the
+                // arithmetic below so an opaque window is bit-exact.
+                u8::MAX => channel,
+                alpha => {
+                    (((channel as u32 * 255) + alpha as u32 / 2) / alpha as u32).min(255) as u8
+                }
+            };
+            destination[0] = straighten(source[2]);
+            destination[1] = straighten(source[1]);
+            destination[2] = straighten(source[0]);
+            destination[3] = alpha;
+        }
+    }
+    Ok(rgba)
 }
 
 impl DirectXResources {
@@ -1953,5 +2163,116 @@ mod dxgi {
             (number >> 16) & 0xFFFF,
             number & 0xFFFF
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Deliberately not `use super::*`: that would also pull in this module's
+    // `use gpui::*`, and gpui exports an attribute macro named `test` which
+    // would shadow the built-in one and expand into itself.
+    use super::bgra_to_straight_rgba;
+
+    /// Build one mapped row: `width` BGRA pixels followed by whatever padding
+    /// the pitch asks for, filled with a value that must never reach the output.
+    fn row(pixels: &[[u8; 4]], row_pitch: usize) -> Vec<u8> {
+        let mut row: Vec<u8> = pixels.iter().flatten().copied().collect();
+        row.resize(row_pitch, 0xCD);
+        row
+    }
+
+    /// The whole reason the repack copies row by row. A driver is free to hand
+    /// back a stride wider than the visible row, and reading straight through
+    /// would pull that padding into the next row and shear the image — on some
+    /// window widths and some GPUs only, which is what makes it worth pinning.
+    #[test]
+    fn row_padding_is_skipped_rather_than_copied() {
+        let opaque_red = [0, 0, 255, 255];
+        let opaque_blue = [255, 0, 0, 255];
+        let row_pitch = 24;
+
+        let mut mapped = row(&[opaque_red, opaque_red], row_pitch);
+        mapped.extend(row(&[opaque_blue, opaque_blue], row_pitch));
+
+        let rgba = bgra_to_straight_rgba(&mapped, row_pitch, 2, 2).unwrap();
+
+        assert_eq!(rgba.len(), 2 * 2 * 4, "the output is tightly packed");
+        assert_eq!(
+            &rgba[..8],
+            &[255, 0, 0, 255, 255, 0, 0, 255],
+            "first row is red"
+        );
+        assert_eq!(
+            &rgba[8..],
+            &[0, 0, 255, 255, 0, 0, 255, 255],
+            "second row is blue"
+        );
+    }
+
+    /// The back buffer is BGRA and an `RgbaImage` is RGBA. Getting this backwards
+    /// is invisible on greys and on anything symmetric, so the fixture is
+    /// deliberately asymmetric in all three colour channels.
+    #[test]
+    fn blue_and_red_channels_are_swapped() {
+        let bgra = [[10, 20, 30, 255]];
+        let rgba = bgra_to_straight_rgba(&row(&bgra, 4), 4, 1, 1).unwrap();
+        assert_eq!(rgba, vec![30, 20, 10, 255]);
+    }
+
+    /// An opaque pixel is already straight-alpha, so it must survive byte for
+    /// byte rather than drift through the division.
+    #[test]
+    fn opaque_pixels_pass_through_untouched() {
+        for channel in [0, 1, 127, 128, 254, 255] {
+            let bgra = [[channel, channel, channel, 255]];
+            let rgba = bgra_to_straight_rgba(&row(&bgra, 4), 4, 1, 1).unwrap();
+            assert_eq!(
+                rgba,
+                vec![channel, channel, channel, 255],
+                "channel {channel}"
+            );
+        }
+    }
+
+    /// A composition back buffer stores colour premultiplied by alpha; PNG wants
+    /// it straight. Half-transparent white is stored as half-intensity and has
+    /// to come back out as white.
+    #[test]
+    fn translucent_pixels_are_unpremultiplied() {
+        let half_transparent_white = [[128, 128, 128, 128]];
+        let rgba = bgra_to_straight_rgba(&row(&half_transparent_white, 4), 4, 1, 1).unwrap();
+        assert_eq!(rgba, vec![255, 255, 255, 128]);
+    }
+
+    /// A fully transparent pixel carries no colour to recover, and the division
+    /// that straightens the others is undefined at zero alpha.
+    #[test]
+    fn fully_transparent_pixels_stay_zero() {
+        let rgba = bgra_to_straight_rgba(&row(&[[0, 0, 0, 0]], 4), 4, 1, 1).unwrap();
+        assert_eq!(rgba, vec![0, 0, 0, 0]);
+    }
+
+    /// Every rejection below would otherwise be a panic or an out-of-bounds read
+    /// deep inside the copy loop.
+    #[test]
+    fn malformed_geometry_is_rejected() {
+        let pixel = row(&[[1, 2, 3, 4]], 4);
+
+        assert!(
+            bgra_to_straight_rgba(&pixel, 4, 0, 1).is_err(),
+            "zero width"
+        );
+        assert!(
+            bgra_to_straight_rgba(&pixel, 4, 1, 0).is_err(),
+            "zero height"
+        );
+        assert!(
+            bgra_to_straight_rgba(&pixel, 3, 1, 1).is_err(),
+            "a pitch narrower than one row cannot hold it"
+        );
+        assert!(
+            bgra_to_straight_rgba(&pixel, 4, 1, 2).is_err(),
+            "one mapped row cannot supply two"
+        );
     }
 }

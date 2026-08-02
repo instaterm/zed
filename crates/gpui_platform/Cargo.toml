@@ -14,7 +14,13 @@ path = "src/gpui_platform.rs"
 [features]
 default = []
 font-kit = ["gpui_macos/font-kit"]
-test-support = ["gpui/test-support", "gpui_macos/test-support"]
+# Forwarded to every platform crate that implements the test-support surface,
+# the same way `screen-capture` below is. Enabling only `gpui/test-support`
+# still compiles on such a platform but leaves `PlatformWindow::render_to_image`
+# on the trait's "not implemented for this platform" default, which fails at
+# runtime with no compile-time signal. Naming a platform crate here is a no-op
+# on targets it is not a dependency of.
+test-support = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support"]
 screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
 runtime_shaders = ["gpui_macos/runtime_shaders"]
 wayland = ["gpui_linux/wayland"]
