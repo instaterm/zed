@@ -1096,16 +1096,25 @@ impl WindowsWindowInner {
     }
 
     fn handle_cursor_changed(&self, lparam: LPARAM) -> Option<isize> {
-        let had_cursor = self.state.current_cursor.get().is_some();
-
-        self.state.current_cursor.set(if lparam.0 == 0 {
+        let cursor = if lparam.0 == 0 {
             None
         } else {
             Some(HCURSOR(lparam.0 as _))
-        });
+        };
+        self.state.current_cursor.set(cursor);
 
-        if had_cursor != self.state.current_cursor.get().is_some() {
-            unsafe { SetCursor(self.state.current_cursor.get()) };
+        // Apply it now rather than waiting for the next `WM_SETCURSOR`: the style
+        // can change with the pointer standing still (a modifier press making a
+        // link clickable, content finishing an async load), and the system only
+        // sends `WM_SETCURSOR` when the mouse moves.
+        //
+        // `SetCursor` sets the shape for the whole calling thread, while this
+        // message is broadcast to every window, so only the window the pointer is
+        // actually over may apply it — otherwise a style change in a background
+        // window would overwrite the shape under the pointer. Suppressed while the
+        // cursor is hidden, which `handle_set_cursor` honours the same way.
+        if self.state.hovered.get() && self.state.cursor_visible.load(Ordering::Relaxed) {
+            unsafe { SetCursor(cursor) };
         }
 
         Some(0)
