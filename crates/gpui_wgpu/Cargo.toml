@@ -14,6 +14,10 @@ path = "src/gpui_wgpu.rs"
 [features]
 default = []
 font-kit = ["dep:font-kit"]
+# Gates the offscreen readback path that backs `PlatformWindow::render_to_image`
+# on the wgpu backends. Ordinary builds do not compile it, matching how
+# gpui_macos and gpui_windows gate their own capture entry points.
+test-support = ["gpui/test-support"]
 
 [dependencies]
 gpui.workspace = true
@@ -22,6 +26,7 @@ bytemuck = "1"
 collections.workspace = true
 cosmic-text = "0.17.0"
 etagere = "0.2"
+image.workspace = true
 itertools.workspace = true
 log.workspace = true
 parking_lot.workspace = true

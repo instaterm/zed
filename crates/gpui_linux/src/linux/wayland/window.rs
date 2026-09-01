@@ -1424,6 +1424,13 @@ impl PlatformWindow for WaylandWindow {
         state.renderer.sprite_atlas().clone()
     }
 
+    /// See the X11 implementation: same forward, same gate, same reasons.
+    #[cfg(feature = "test-support")]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        let mut state = self.borrow_mut();
+        state.renderer.render_to_image(scene)
+    }
+
     fn show_window_menu(&self, position: Point<Pixels>) {
         let state = self.borrow();
         let serial = state.client.get_serial(SerialKind::MousePress);

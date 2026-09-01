@@ -13,7 +13,12 @@ path = "src/gpui_linux.rs"
 
 [features]
 default = ["wayland", "x11"]
-test-support = ["gpui/test-support"]
+# `gpui_wgpu` is optional here, pulled in by the `x11` / `wayland` features, so
+# the forward is conditional on it: `?` makes this a no-op rather than an error
+# when neither backend is enabled. Dropping the forward is a build error rather
+# than a silent runtime fallback — the window implementations call a renderer
+# method that only exists behind `gpui_wgpu`'s own `test-support`.
+test-support = ["gpui/test-support", "gpui_wgpu?/test-support"]
 wayland = [
     "bitflags",
     "gpui_wgpu",

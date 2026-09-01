@@ -1693,6 +1693,17 @@ impl PlatformWindow for X11Window {
         inner.renderer.sprite_atlas().clone()
     }
 
+    /// See `WgpuRenderer::render_to_image`, which both Linux backends forward
+    /// to. Gated on the feature alone rather than `any(test, ...)`: unlike the
+    /// macOS and Windows backends, the implementation lives in a dependency
+    /// here, and `cfg(test)` does not reach across the crate boundary to build
+    /// it.
+    #[cfg(feature = "test-support")]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        let mut inner = self.0.state.borrow_mut();
+        inner.renderer.render_to_image(scene)
+    }
+
     fn show_window_menu(&self, position: Point<Pixels>) {
         let state = self.0.state.borrow();
 

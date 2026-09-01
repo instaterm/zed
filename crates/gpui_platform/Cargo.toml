@@ -20,7 +20,7 @@ font-kit = ["gpui_macos/font-kit"]
 # on the trait's "not implemented for this platform" default, which fails at
 # runtime with no compile-time signal. Naming a platform crate here is a no-op
 # on targets it is not a dependency of.
-test-support = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support"]
+test-support = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support", "gpui_linux/test-support"]
 screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
 runtime_shaders = ["gpui_macos/runtime_shaders"]
 wayland = ["gpui_linux/wayland"]

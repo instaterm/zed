@@ -101,6 +101,32 @@ struct WgpuBindGroupLayouts {
     surfaces: wgpu::BindGroupLayout,
 }
 
+/// Surface formats this renderer asks for, best first.
+///
+/// Both are 8-bit, unsigned-normalised and non-sRGB, which is what the shaders
+/// and the blend states are written against. A surface that offers neither is
+/// still configured — see the fallbacks at the use site — so this is a
+/// preference, not a guarantee, and anything reading pixels back out of a
+/// surface has to cope with a format outside this list.
+const PREFERRED_SURFACE_FORMATS: [wgpu::TextureFormat; 2] = [
+    wgpu::TextureFormat::Bgra8Unorm,
+    wgpu::TextureFormat::Rgba8Unorm,
+];
+
+/// Whether a scene encoding reached the render target.
+///
+/// The instance buffer grows by doubling until a scene fits; once it is already
+/// at the device's maximum size there is nowhere left to grow, and the attempt
+/// is abandoned with nothing submitted. Presentation shrugs that off as a
+/// dropped frame, but a caller that reads the target back afterwards must not
+/// mistake whatever preceded it for a freshly rendered scene — so the two
+/// outcomes are reported apart rather than folded together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SceneSubmission {
+    Encoded,
+    AbandonedAtBufferLimit,
+}
+
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
 pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 
@@ -266,11 +292,7 @@ impl WgpuRenderer {
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
         let surface_caps = surface.get_capabilities(&context.adapter);
-        let preferred_formats = [
-            wgpu::TextureFormat::Bgra8Unorm,
-            wgpu::TextureFormat::Rgba8Unorm,
-        ];
-        let surface_format = preferred_formats
+        let surface_format = PREFERRED_SURFACE_FORMATS
             .iter()
             .find(|f| surface_caps.formats.contains(f))
             .copied()
@@ -1151,6 +1173,32 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Matched rather than discarded so a third outcome cannot land here
+        // silently: presentation is the one caller that folds outcomes
+        // together, and it should have to say so again if the set grows. A
+        // scene abandoned at the buffer limit had nothing submitted for it at
+        // all, and presenting that dropped frame is what this has always done
+        // rather than stall the window. Capture cannot be as forgiving — see
+        // `render_to_image`.
+        match self.submit_scene(scene, &frame_view) {
+            SceneSubmission::Encoded | SceneSubmission::AbandonedAtBufferLimit => frame.present(),
+        }
+        true
+    }
+
+    /// Encode one scene into `target` and submit it, without presenting.
+    ///
+    /// Shared by ordinary presentation and by capture so both go through the
+    /// same shaders, atlas, clipping and blending rather than growing a second
+    /// renderer. Everything above this — the health checks, the atlas upload
+    /// flush, the intermediate textures — belongs to preparing a frame and is
+    /// the caller's to do; splitting presentation out is the only difference
+    /// between the two callers.
+    ///
+    /// The caller is also responsible for the target's contents on
+    /// [`SceneSubmission::AbandonedAtBufferLimit`]: nothing is submitted in that
+    /// case, so the target holds whatever preceded the call.
+    fn submit_scene(&mut self, scene: &Scene, target: &wgpu::TextureView) -> SceneSubmission {
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
@@ -1213,7 +1261,7 @@ impl WgpuRenderer {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
+                        view: target,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1252,7 +1300,7 @@ impl WgpuRenderer {
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &frame_view,
+                                    view: target,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
                                         load: wgpu::LoadOp::Load,
@@ -1320,8 +1368,7 @@ impl WgpuRenderer {
                         "instance buffer size grew too large: {}",
                         self.instance_buffer_capacity
                     );
-                    frame.present();
-                    return true;
+                    return SceneSubmission::AbandonedAtBufferLimit;
                 }
                 self.grow_instance_buffer();
                 continue;
@@ -1330,9 +1377,237 @@ impl WgpuRenderer {
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
-            frame.present();
-            return true;
+            return SceneSubmission::Encoded;
         }
+    }
+
+    /// Render one scene and read it back as an image instead of presenting it.
+    ///
+    /// Backs `PlatformWindow::render_to_image` on the wgpu backends. The scene
+    /// goes through [`Self::submit_scene`] — the same path presentation uses,
+    /// against this window's own device, pipelines and sprite atlas — so what
+    /// comes back is what would have gone on screen. Nothing here touches the
+    /// window surface or asks the window system for anything: the pixels are
+    /// read out of a texture this process rendered itself.
+    #[cfg(all(not(target_family = "wasm"), any(test, feature = "test-support")))]
+    pub fn render_to_image(&mut self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        use anyhow::Context as _;
+
+        anyhow::ensure!(
+            !self.device_lost(),
+            "cannot capture: the GPU device was lost and has not been recovered"
+        );
+        // The surface being unconfigured means there is no agreed size or format
+        // to render at. Presentation treats this as a frame to skip; capture has
+        // nothing to hand back and says so.
+        anyhow::ensure!(
+            self.surface_configured,
+            "cannot capture: the surface is not configured"
+        );
+        // `destroy` releases the GPU resources without touching
+        // `surface_configured`, so the flag above does not stand in for their
+        // presence. Everything below reaches for them through `resources()`,
+        // which panics when they are gone; capture reports it instead.
+        anyhow::ensure!(
+            self.resources.is_some(),
+            "cannot capture: the renderer's GPU resources have been released"
+        );
+
+        // The same frame preparation `draw` does, and for the same reasons.
+        // `before_frame` is the only place the atlas flushes pending uploads,
+        // and the scene about to be encoded may well have rasterized new glyphs
+        // that are still sitting in that queue — skipping it samples from
+        // texture regions that were never written. `ensure_intermediate_textures`
+        // covers the window after a device recovery or a resize, when the path
+        // intermediates have been invalidated. Both are no-ops when there is
+        // nothing to do, so neither needs a condition.
+        self.atlas.before_frame();
+        self.ensure_intermediate_textures();
+
+        // Straight from the surface configuration, the same place
+        // `capture_scene` reads its geometry from, so the image can only ever
+        // describe the drawable this renderer is actually configured for.
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+
+        let device = Arc::clone(&self.resources().device);
+        // Errors are collected through a scope rather than through the
+        // renderer's `last_error`: that field is the frame-failure counter
+        // `draw` reads to drive its own recovery, and consuming an error here
+        // would take the signal away from it.
+        // All three filters, not just validation. An error this capture raises
+        // that no scope catches reaches the device's uncaptured-error handler,
+        // which writes `last_error` — and `last_error` is the frame-failure
+        // signal the *next* `draw` reads. Capture allocates a full-window
+        // texture and a readback buffer of its own, so running out of memory
+        // here is the realistic case: without the outer scopes it would be
+        // charged to presentation, which clears the whole sprite atlas once
+        // enough consecutive frames have failed.
+        //
+        // Nested scopes are a stack, so each error is taken by the innermost
+        // scope whose filter matches, and they pop in reverse. Every `pop` is
+        // evaluated before the result is inspected — leaving a scope on the
+        // stack would misroute errors from the rest of the process.
+        let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let captured = self.capture_scene(scene);
+        let error = pollster::block_on(validation.pop())
+            .or(pollster::block_on(internal.pop()))
+            .or(pollster::block_on(out_of_memory.pop()));
+        if let Some(error) = error {
+            anyhow::bail!("GPU error during capture: {error}");
+        }
+        let pixels = captured?;
+
+        image::RgbaImage::from_raw(width, height, pixels)
+            .context("assembling the captured pixels into an image")
+    }
+
+    /// The body of [`Self::render_to_image`], minus the error scope around it.
+    ///
+    /// Split out so every early return still passes through the scope's `pop`:
+    /// a validation error raised by work this function abandoned would otherwise
+    /// stay in the scope and surface against an unrelated later capture.
+    #[cfg(all(not(target_family = "wasm"), any(test, feature = "test-support")))]
+    fn capture_scene(&mut self, scene: &Scene) -> anyhow::Result<Vec<u8>> {
+        use anyhow::Context as _;
+
+        let format = self.surface_config.format;
+        let channel_order = ChannelOrder::for_format(format).with_context(|| {
+            format!("cannot capture a surface in {format:?}: byte layout is not known")
+        })?;
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+        anyhow::ensure!(
+            width > 0 && height > 0,
+            "cannot capture a {width}x{height} surface"
+        );
+
+        // Settled up front so a capture that cannot work costs neither a
+        // texture allocation nor a rendered frame. `copy_texture_to_buffer`
+        // requires each row to start on a 256-byte boundary, so all but the
+        // narrowest captures come back with padding at the end of every row;
+        // `depad_to_rgba` is what removes it again.
+        let row_bytes = (width as usize)
+            .checked_mul(4)
+            .context("surface width overflows a pixel row")?;
+        let padded_row_bytes = (row_bytes as u32)
+            .checked_next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            .context("padded row size overflows")?;
+        let buffer_size = (padded_row_bytes as u64)
+            .checked_mul(height as u64)
+            .context("capture buffer size overflows")?;
+        anyhow::ensure!(
+            buffer_size <= self.max_buffer_size,
+            "a {width}x{height} capture needs {buffer_size} bytes, over this device's {} byte limit",
+            self.max_buffer_size
+        );
+
+        let device = Arc::clone(&self.resources().device);
+        let queue = Arc::clone(&self.resources().queue);
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("capture_target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // The pipelines were built against the surface format, so the
+            // offscreen target has to agree with it to reuse them.
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        if self.submit_scene(scene, &view) == SceneSubmission::AbandonedAtBufferLimit {
+            // Nothing was submitted, so the texture holds undefined contents.
+            // Reporting that as a successful capture would be a blank or garbage
+            // image indistinguishable from a real one.
+            anyhow::bail!(
+                "no scene was submitted: the instance buffer is already at the device maximum of {} bytes",
+                self.max_buffer_size
+            );
+        }
+
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture_readback"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("capture_encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // Mapping is asynchronous by construction; polling to completion is how
+        // it is made synchronous without an event loop to drive. The wait is on
+        // the UI thread for the duration of the capture, which this capability
+        // accepts — it exists for development and automation, not for a hot path.
+        // A channel rather than a cheaper single-threaded cell because the
+        // callback is required to be `Send`: wgpu may run it from whichever
+        // thread completes the mapping.
+        let (mapped_tx, mapped_rx) = std::sync::mpsc::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = mapped_tx.send(result);
+            });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .context("waiting for the capture readback to complete")?;
+        match mapped_rx.try_recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => anyhow::bail!("mapping the capture buffer failed: {error}"),
+            // The poll above returned without the callback having run, so the
+            // buffer is not mapped and reading it would panic.
+            Err(_) => anyhow::bail!("the capture buffer was never mapped"),
+        }
+
+        // Unmapped before the result is inspected, so an error in the repack
+        // cannot leave the buffer mapped for the rest of the process.
+        let repacked = {
+            let view = buffer.slice(..).get_mapped_range();
+            depad_to_rgba(
+                &view,
+                padded_row_bytes as usize,
+                width,
+                height,
+                channel_order,
+                self.surface_config.alpha_mode,
+            )
+        };
+        buffer.unmap();
+        repacked
     }
 
     fn draw_quads(
@@ -1847,6 +2122,136 @@ impl WgpuRenderer {
     }
 }
 
+/// Which byte of a captured pixel holds red.
+///
+/// Only the two 8-bit orders the renderer itself prefers are accepted; anything
+/// else fails the capture rather than guessing at a byte layout and returning a
+/// plausible-looking image with the channels rearranged.
+#[cfg(all(not(target_family = "wasm"), any(test, feature = "test-support")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelOrder {
+    Bgra,
+    Rgba,
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, feature = "test-support")))]
+impl ChannelOrder {
+    /// The inverse of [`PREFERRED_SURFACE_FORMATS`]: every format this renderer
+    /// asks for has a known byte order here, and `capture_formats_cover_the_preferred_list`
+    /// holds the two together. Formats reached through the fallbacks at the
+    /// surface-configuration site are the ones that return `None`.
+    fn for_format(format: wgpu::TextureFormat) -> Option<Self> {
+        match format {
+            wgpu::TextureFormat::Bgra8Unorm => Some(Self::Bgra),
+            wgpu::TextureFormat::Rgba8Unorm => Some(Self::Rgba),
+            _ => None,
+        }
+    }
+
+    /// Which byte of a source pixel holds red, and which holds blue.
+    fn red_and_blue(self) -> (usize, usize) {
+        match self {
+            Self::Bgra => (2, 0),
+            Self::Rgba => (0, 2),
+        }
+    }
+}
+
+/// Recover one straight-alpha channel from a premultiplied one.
+#[cfg(all(not(target_family = "wasm"), any(test, feature = "test-support")))]
+fn straighten(channel: u8, alpha: u8) -> u8 {
+    match alpha {
+        // No colour to recover, and dividing by it is undefined anyway.
+        0 => 0,
+        // Already straight. Taken verbatim rather than through the arithmetic
+        // below so an opaque window is bit-exact.
+        u8::MAX => channel,
+        alpha => (((channel as u32 * 255) + alpha as u32 / 2) / alpha as u32).min(255) as u8,
+    }
+}
+
+/// Repack a mapped capture buffer into the tightly packed, straight-alpha RGBA
+/// that [`image::RgbaImage`] holds.
+///
+/// Split out from the capture itself because each of these conversions is
+/// silent when wrong and none of them needs a GPU to check:
+///
+/// * **Row padding.** `copy_texture_to_buffer` requires rows to start on a
+///   256-byte boundary, so most widths come back with padding at the end of
+///   every row. Reading straight through pulls that padding into the next row
+///   and shears the image — on exactly the widths where the two differ, and
+///   correct everywhere else.
+/// * **Channel order.** The surface may be BGRA or RGBA. Getting it backwards is
+///   invisible on greys and on anything symmetric.
+/// * **Premultiplied alpha.** A surface composited with premultiplied alpha
+///   stores colour already multiplied by alpha; PNG wants it straight. Opaque
+///   pixels are unaffected either way, so the mistake only surfaces on a
+///   translucent window.
+#[cfg(all(not(target_family = "wasm"), any(test, feature = "test-support")))]
+fn depad_to_rgba(
+    mapped: &[u8],
+    padded_row_bytes: usize,
+    width: u32,
+    height: u32,
+    channel_order: ChannelOrder,
+    alpha_mode: wgpu::CompositeAlphaMode,
+) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context as _;
+
+    anyhow::ensure!(
+        width > 0 && height > 0,
+        "cannot capture a {width}x{height} surface"
+    );
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .context("surface width overflows a pixel row")?;
+    anyhow::ensure!(
+        padded_row_bytes >= row_bytes,
+        "padded row of {padded_row_bytes} bytes is narrower than the {row_bytes}-byte row it must hold"
+    );
+    // Checked, because these numbers come from a texture description and a
+    // driver alignment: a wrapped product here would understate the requirement
+    // and let the loop below index past the mapping.
+    let required = padded_row_bytes
+        .checked_mul(height as usize - 1)
+        .and_then(|full_rows| full_rows.checked_add(row_bytes))
+        .context("surface dimensions overflow the mapped size they would need")?;
+    anyhow::ensure!(
+        mapped.len() >= required,
+        "mapped {} bytes, but {width}x{height} at a {padded_row_bytes}-byte row pitch needs {required}",
+        mapped.len()
+    );
+
+    // Both are fixed for the whole capture, so they are settled here rather than
+    // re-decided per pixel. Whether the surface is premultiplied is decided by
+    // the alpha mode alone: the same value picks the blend state the pipelines
+    // were built with and the `premultiplied_alpha` uniform the shaders read, so
+    // the bytes in the target follow it exactly.
+    let premultiplied = alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+    let (red, blue) = channel_order.red_and_blue();
+
+    let mut rgba = vec![0u8; row_bytes * height as usize];
+    for y in 0..height as usize {
+        let source = &mapped[y * padded_row_bytes..][..row_bytes];
+        let destination = &mut rgba[y * row_bytes..][..row_bytes];
+        for (source, destination) in source.chunks_exact(4).zip(destination.chunks_exact_mut(4)) {
+            let alpha = source[3];
+            let (r, g, b) = (source[red], source[1], source[blue]);
+            let (r, g, b) = if premultiplied {
+                (
+                    straighten(r, alpha),
+                    straighten(g, alpha),
+                    straighten(b, alpha),
+                )
+            } else {
+                (r, g, b)
+            };
+            destination.copy_from_slice(&[r, g, b, alpha]);
+        }
+    }
+    Ok(rgba)
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn create_surface(
     instance: &wgpu::Instance,
@@ -1904,6 +2309,213 @@ impl RenderingParameters {
             gamma_ratios,
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
+        }
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    // Deliberately not `use super::*`: that would also pull in this module's
+    // `use gpui::...`, and gpui exports an attribute macro named `test` that
+    // would shadow the built-in one.
+    use super::{ChannelOrder, PREFERRED_SURFACE_FORMATS, depad_to_rgba};
+
+    const OPAQUE: wgpu::CompositeAlphaMode = wgpu::CompositeAlphaMode::Opaque;
+    const PREMULTIPLIED: wgpu::CompositeAlphaMode = wgpu::CompositeAlphaMode::PreMultiplied;
+
+    /// Build one mapped row: `width` pixels followed by whatever padding the
+    /// pitch asks for, filled with a value that must never reach the output.
+    fn row(pixels: &[[u8; 4]], padded_row_bytes: usize) -> Vec<u8> {
+        let mut row: Vec<u8> = pixels.iter().flatten().copied().collect();
+        row.resize(padded_row_bytes, 0xCD);
+        row
+    }
+
+    /// Repack a single pixel, the shape most of these tests want.
+    fn repack_one(
+        pixel: [u8; 4],
+        channel_order: ChannelOrder,
+        alpha_mode: wgpu::CompositeAlphaMode,
+    ) -> Vec<u8> {
+        depad_to_rgba(&row(&[pixel], 4), 4, 1, 1, channel_order, alpha_mode).unwrap()
+    }
+
+    /// The whole reason the repack copies row by row. `copy_texture_to_buffer`
+    /// requires rows to start on a 256-byte boundary, so all but the widest
+    /// captures come back padded; reading straight through would pull that
+    /// padding into the next row and shear the image.
+    #[test]
+    fn row_padding_is_skipped_rather_than_copied() {
+        let red = [0, 0, 255, 255];
+        let blue = [255, 0, 0, 255];
+        let padded_row_bytes = 256;
+
+        let mut mapped = row(&[red, red], padded_row_bytes);
+        mapped.extend(row(&[blue, blue], padded_row_bytes));
+
+        let rgba =
+            depad_to_rgba(&mapped, padded_row_bytes, 2, 2, ChannelOrder::Bgra, OPAQUE).unwrap();
+
+        assert_eq!(rgba.len(), 2 * 2 * 4, "the output is tightly packed");
+        assert_eq!(
+            &rgba[..8],
+            &[255, 0, 0, 255, 255, 0, 0, 255],
+            "first row is red"
+        );
+        assert_eq!(
+            &rgba[8..],
+            &[0, 0, 255, 255, 0, 0, 255, 255],
+            "second row is blue"
+        );
+    }
+
+    /// An odd width is the case the alignment rule bites hardest on: 3 pixels is
+    /// 12 bytes in a 256-byte row, so all but the first twelve bytes of every
+    /// row are padding.
+    #[test]
+    fn an_odd_width_reads_back_without_shearing() {
+        let padded_row_bytes = 256;
+        let pixel = |n: u8| [n, n, n, 255];
+
+        let mut mapped = row(&[pixel(1), pixel(2), pixel(3)], padded_row_bytes);
+        mapped.extend(row(&[pixel(4), pixel(5), pixel(6)], padded_row_bytes));
+        mapped.extend(row(&[pixel(7), pixel(8), pixel(9)], padded_row_bytes));
+
+        let rgba =
+            depad_to_rgba(&mapped, padded_row_bytes, 3, 3, ChannelOrder::Rgba, OPAQUE).unwrap();
+
+        assert_eq!(rgba.len(), 3 * 3 * 4);
+        let reds: Vec<u8> = rgba.chunks_exact(4).map(|pixel| pixel[0]).collect();
+        assert_eq!(
+            reds,
+            (1..=9).collect::<Vec<u8>>(),
+            "every pixel lands in its own place"
+        );
+    }
+
+    /// A BGRA surface has to be swapped and an RGBA one must not be. Getting
+    /// either backwards is invisible on greys, so the fixture is deliberately
+    /// asymmetric in all three colour channels.
+    #[test]
+    fn channels_are_swapped_only_for_a_bgra_surface() {
+        let pixel = [10, 20, 30, 255];
+        assert_eq!(
+            repack_one(pixel, ChannelOrder::Bgra, OPAQUE),
+            vec![30, 20, 10, 255],
+            "blue and red trade places"
+        );
+        assert_eq!(
+            repack_one(pixel, ChannelOrder::Rgba, OPAQUE),
+            vec![10, 20, 30, 255],
+            "already in order"
+        );
+    }
+
+    /// An opaque pixel is already straight-alpha, so it must survive byte for
+    /// byte rather than drift through the division.
+    #[test]
+    fn opaque_pixels_pass_through_untouched() {
+        for channel in [0, 1, 127, 128, 254, 255] {
+            let pixel = [channel, channel, channel, 255];
+            assert_eq!(
+                repack_one(pixel, ChannelOrder::Rgba, PREMULTIPLIED),
+                vec![channel, channel, channel, 255],
+                "channel {channel}"
+            );
+        }
+    }
+
+    /// A premultiplied surface stores colour multiplied by alpha; PNG wants it
+    /// straight. Half-transparent white is stored at half intensity and has to
+    /// come back out as white. The same bytes on a surface that was never
+    /// premultiplied are already straight, and dividing them would wash the
+    /// image out.
+    #[test]
+    fn translucent_pixels_are_straightened_only_when_premultiplied() {
+        let pixel = [128, 128, 128, 128];
+        assert_eq!(
+            repack_one(pixel, ChannelOrder::Rgba, PREMULTIPLIED),
+            vec![255, 255, 255, 128]
+        );
+        assert_eq!(
+            repack_one(pixel, ChannelOrder::Rgba, OPAQUE),
+            vec![128, 128, 128, 128]
+        );
+    }
+
+    /// A fully transparent pixel carries no colour to recover, and the division
+    /// that straightens the others is undefined at zero alpha.
+    #[test]
+    fn fully_transparent_pixels_stay_zero() {
+        assert_eq!(
+            repack_one([0, 0, 0, 0], ChannelOrder::Rgba, PREMULTIPLIED),
+            vec![0, 0, 0, 0]
+        );
+    }
+
+    /// Every rejection below would otherwise be a panic or an out-of-bounds read
+    /// inside the copy loop.
+    #[test]
+    fn malformed_geometry_is_rejected() {
+        let pixel = row(&[[1, 2, 3, 4]], 4);
+        let repack = |padded_row_bytes, width, height| {
+            depad_to_rgba(
+                &pixel,
+                padded_row_bytes,
+                width,
+                height,
+                ChannelOrder::Rgba,
+                OPAQUE,
+            )
+        };
+
+        assert!(repack(4, 0, 1).is_err(), "zero width");
+        assert!(repack(4, 1, 0).is_err(), "zero height");
+        assert!(repack(3, 1, 1).is_err(), "row pitch narrower than the row");
+        assert!(
+            repack(4, 2, 1).is_err(),
+            "mapping too short for the claimed width"
+        );
+        assert!(
+            repack(4, 1, 2).is_err(),
+            "mapping too short for the claimed height"
+        );
+    }
+
+    /// The format gate. Anything outside these two fails the capture rather than
+    /// producing an image with its channels silently rearranged.
+    #[test]
+    fn only_known_eight_bit_formats_are_accepted() {
+        assert_eq!(
+            ChannelOrder::for_format(wgpu::TextureFormat::Bgra8Unorm),
+            Some(ChannelOrder::Bgra)
+        );
+        assert_eq!(
+            ChannelOrder::for_format(wgpu::TextureFormat::Rgba8Unorm),
+            Some(ChannelOrder::Rgba)
+        );
+        assert_eq!(
+            ChannelOrder::for_format(wgpu::TextureFormat::Bgra8UnormSrgb),
+            None
+        );
+        assert_eq!(
+            ChannelOrder::for_format(wgpu::TextureFormat::Rgba16Float),
+            None
+        );
+    }
+
+    /// The gate above and the format preference the renderer configures its
+    /// surface with are two lists a thousand lines apart. Adding a format to the
+    /// preferred one without teaching the gate its byte order would leave
+    /// capture failing on whichever machines take the new format, so the two are
+    /// held together here rather than by whoever happens to notice.
+    #[test]
+    fn capture_formats_cover_the_preferred_list() {
+        for format in PREFERRED_SURFACE_FORMATS {
+            assert!(
+                ChannelOrder::for_format(format).is_some(),
+                "{format:?} is configured but cannot be read back"
+            );
         }
     }
 }
